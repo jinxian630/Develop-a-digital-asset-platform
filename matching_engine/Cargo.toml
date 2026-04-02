@@ -1,0 +1,26 @@
+[package]
+name = "matching_engine"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+# 异步运行时：处理并发订单的核心
+tokio = { version = "1.0", features = ["full"] }
+
+# 数据处理：将订单转换为 JSON 格式
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Web API
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
+chrono = "0.4"
+
+# 区块链交互：让 Rust 能监听合约事件
+ethers = "2.0"
+
+# 高性能并发容器：存储订单簿（Orderbook），防止读写冲突
+dashmap = "5.5"
+
+# 日志记录：监控撮合状态
+tracing = "0.1"
+tracing-subscriber = "0.3"
