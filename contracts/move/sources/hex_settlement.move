@@ -1,11 +1,8 @@
+/// Atomically swaps two matched coin objects between counterparties.
+#[allow(duplicate_alias, lint(public_entry))]
 module hex::settlement {
-    use sui::coin::{Self, Coin};
-    use sui::transfer;
-    use sui::tx_context::TxContext;
+    use sui::coin::Coin;
 
-    /// Atomically swaps two matched coin objects between counterparties.
-    /// `_ctx` is required by the Sui Move entry function signature
-    /// but is unused here — settlement is purely object-based.
     public entry fun execute_trade<T1, T2>(
         coin_a: Coin<T1>,
         coin_b: Coin<T2>,

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use crate::order::{Order, Side};
 
-pub const MIN_TRADE_AMOUNT: u64 = 1_000;
+pub const MIN_TRADE_AMOUNT: u64 = 1;
 
 pub struct OrderBook {
     // Bids: buy orders — keyed by price descending (highest bid first)

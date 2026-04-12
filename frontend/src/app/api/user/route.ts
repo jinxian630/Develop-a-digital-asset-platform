@@ -1,4 +1,6 @@
-import { db } from '@/lib/db';
+// Fix 1: MySQL removed.
+// User identity is tracked via zkLogin session state in the frontend only.
+// No database record is needed — the Sui address IS the user identity.
 import { NextResponse } from 'next/server';
 
 export async function POST(req: Request) {
@@ -9,22 +11,12 @@ export async function POST(req: Request) {
             return NextResponse.json({ error: 'Missing wallet_address' }, { status: 400 });
         }
 
-        // Insert user if not exists
-        await db.execute(
-            'INSERT IGNORE INTO users (wallet_address) VALUES (?)',
-            [wallet_address]
-        );
-        
-        // Initialize balance if new
-        // Start users off with 0 HEX and 5000 MYRC for the demo
-        await db.execute(
-            'INSERT IGNORE INTO balances (wallet_address, hex_balance, myrc_balance) VALUES (?, 0, 5000)',
-            [wallet_address]
-        );
-
-        return NextResponse.json({ success: true });
+        // No-op: previously wrote to MySQL. Now we acknowledge the address exists
+        // and let the frontend manage session state. On-chain data (HEX balance,
+        // trade history) is queried live from Sui Testnet.
+        return NextResponse.json({ success: true, address: wallet_address });
     } catch (error) {
         console.error('API /user POST Error:', error);
-        return NextResponse.json({ error: 'Database Error while provisioning user' }, { status: 500 });
+        return NextResponse.json({ error: 'Internal error' }, { status: 500 });
     }
 }

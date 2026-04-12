@@ -1,4 +1,7 @@
-import { db } from '@/lib/db';
+// Fix 1: MySQL removed.
+// HEX balances are now sourced exclusively from on-chain state via suiClient.getCoins().
+// This endpoint is retained as a stub so existing callers don't 404,
+// but it performs no database writes. The authoritative balance is always on-chain.
 import { NextResponse } from 'next/server';
 
 export async function PUT(req: Request) {
@@ -9,21 +12,12 @@ export async function PUT(req: Request) {
             return NextResponse.json({ error: 'Missing parameters' }, { status: 400 });
         }
 
-        // We assume 1 HEX = 100 MYR cost. So we add_amount to HEX and subtract (add_amount * 100) from MYR.
-        // Wait, add_amount is actually the amount of HEX they receive in executeSwap.
-        // The cost they input is "spendAmount". 
-        // We will just do a simple update for HEX to prove the concept.
-        
-        await db.execute(
-            `UPDATE balances 
-             SET hex_balance = hex_balance + ? 
-             WHERE wallet_address = ?`,
-            [add_amount, address]
-        );
-
-        return NextResponse.json({ success: true });
+        // No-op: previously updated MySQL hex_balance.
+        // Balance is now read live from Sui via client.getCoins({ coinType: HEX_COIN_TYPE }).
+        // The gas station mints HEX on-chain after a successful trade — that IS the update.
+        return NextResponse.json({ success: true, note: 'Balance is authoritative on-chain' });
     } catch (error) {
         console.error('API /balance/update PUT Error:', error);
-        return NextResponse.json({ error: 'Database Error' }, { status: 500 });
+        return NextResponse.json({ error: 'Internal error' }, { status: 500 });
     }
 }

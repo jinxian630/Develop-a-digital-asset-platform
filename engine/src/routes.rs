@@ -37,22 +37,62 @@ pub async fn post_order(
     };
 
     let order_id = order.id.to_string();
+    let side_label = format!("{:?}", order.side).to_uppercase();
+
+    println!(
+        "\n[ORDER] New {:?} order received",
+        order.side
+    );
+    println!(
+        "  ID      : {}",
+        order_id
+    );
+    println!(
+        "  Amount  : {} raw units",
+        order.amount
+    );
+    println!(
+        "  Price   : {} raw units",
+        order.price
+    );
+    println!(
+        "  Owner   : {}…{}",
+        &order.owner_address[..8.min(order.owner_address.len())],
+        &order.owner_address[order.owner_address.len().saturating_sub(4)..]
+    );
 
     let mut book = book.lock().await;
 
     // Add to book with validation
     book.add_order(order).map_err(|e| {
+        println!("[ORDER] ✗ Rejected: {}", e);
         (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse { error: e }),
         )
     })?;
 
+    println!(
+        "[BOOK]  {} side added → Bids: {} level(s) | Asks: {} level(s)",
+        side_label,
+        book.bids.len(),
+        book.asks.len()
+    );
+
     // Attempt match after every new order
+    println!("[MATCH] Checking for match...");
     if let Some((buy, sell)) = book.match_orders() {
+        println!(
+            "[MATCH] ✓ MATCHED!  Buy {} @ {}  <->  Sell {} @ {}",
+            &buy.id.to_string()[..8], buy.price,
+            &sell.id.to_string()[..8], sell.price
+        );
+        println!("[MATCH] Notifying gas station for settlement...");
         // Drop the lock before making an async HTTP call
         drop(book);
         emit_to_gas_station(buy, sell).await;
+    } else {
+        println!("[MATCH] No match yet — order resting in book.");
     }
 
     Ok(Json(OrderResponse {
@@ -60,6 +100,7 @@ pub async fn post_order(
         status: "accepted".to_string(),
     }))
 }
+
 
 // GET /orderbook
 // Returns a snapshot of current bids and asks.
@@ -139,6 +180,7 @@ async fn emit_to_gas_station(buy: Order, sell: Order) {
         "recipientB": sell.owner_address,
         "buyOrderId": buy.id,
         "sellOrderId": sell.id,
+        "amount": buy.amount,
     });
 
     println!(

@@ -1,12 +1,6 @@
-import mysql from 'mysql2/promise';
+// Fix 1: MySQL removed — user records are no longer stored in a database.
+// Identity is managed via zkLogin session state in the frontend.
+// On-chain HEX balances are fetched live from Sui via client.getCoins().
+// This file is intentionally empty (kept for reference; safe to delete).
 
-// Create a connection pool connecting to XAMPP MySQL database "hex_db"
-export const db = mysql.createPool({
-    host: 'localhost',
-    user: 'root',      // Default XAMPP user
-    password: '',      // Default XAMPP password (empty)
-    database: 'hex_db',
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0
-});
+export {};

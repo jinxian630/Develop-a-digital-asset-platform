@@ -1,585 +1,761 @@
 "use client";
-import React, { useState, useEffect } from 'react';
-import { Activity, ShieldCheck, Zap, Wallet, ArrowRightLeft, CheckCircle2, Info, Loader2, AlertTriangle, Copy, LogOut } from 'lucide-react';
-import { Transaction } from '@mysten/sui/transactions';
-import { Auth } from '@/components/Auth';
-import { suiClient } from '@/lib/zklogin';
+import React, { useState, useEffect, useCallback } from "react";
+import {
+  Activity,
+  Wallet,
+  CheckCircle2,
+  AlertTriangle,
+  ArrowRightLeft,
+  BookOpen,
+  Layers,
+  LogOut,
+  Copy,
+  KeyRound,
+  TrendingUp,
+  RefreshCw,
+} from "lucide-react";
+import { suiClient } from "@/lib/zklogin";
+import { Auth } from "@/components/Auth";
+
+const HEX_COIN_TYPE = process.env.NEXT_PUBLIC_HEX_COIN_TYPE ?? "";
+const HEX_MYR_RATE = 100; // 1 HEX = 100 MYR
+
+// ── Fix 2: Unit conversion constants ────────────────────────────────────────
+// HEX stablecoin has 2 decimal places: 100 raw units = 1.00 HEX
+// (matches how the gas station mints: mintAmount = orderAmount / 100)
+const RAW_PER_HEX = 100; // 100 raw HEX units = 1 displayed HEX
+
+// MIST conversion: SUI uses 1e9 MIST per SUI.
+// For the orderbook engine, price and amount are passed as raw integers.
+// We display them in HEX units (divide by RAW_PER_HEX).
+const toHexDisplay = (raw: number) => (raw / RAW_PER_HEX).toFixed(4);
+
+// Minimum order size: 0.01 HEX = 1 raw unit (engine MIN_TRADE_AMOUNT = 1)
+const MIN_HEX_ORDER = 0.01;
 
 export default function HEXDashboard() {
-  const MYR_BALANCE = 5000;          // wallet balance cap
-  const HEX_RATE    = 0.01;          // 1 MYR = 0.01 HEX  (100 MYR = 1 HEX)
-
-  const [latency, setLatency] = useState<number | null>(null);
-  const [logs, setLogs] = useState<any[]>([]);
-  const [hexBalance, setHexBalance] = useState<number>(0);
-  const [myrBalance, setMyrBalance] = useState<number>(5000);
-  const [showToast, setShowToast] = useState(false);
-  const [spendInput, setSpendInput] = useState<string>("100");
-  const spendAmount = parseFloat(spendInput) || 0;
-  
-  // Phase 2 Engine Modal State
-  // Phase 4 General UX State
-  const [isSwapping, setIsSwapping] = useState(false);
-  const [showConfirmModal, setShowConfirmModal] = useState(false);
-  const [tradeError, setTradeError] = useState<string | null>(null);
-
-  // Phase 4: Auth & zkLogin State
+  // ── zkLogin Auth State ──────────────────────────────────────────
   const [suiAddress, setSuiAddress] = useState<string | null>(null);
-  const [jwtToken, setJwtToken] = useState<string | null>(null);
-  const [testnetCoins, setTestnetCoins] = useState<any[]>([]);
 
-  const [showModal, setShowModal] = useState(false);
-  const [latencyHistory, setLatencyHistory] = useState<number[]>([]);
-  const [liveLatency, setLiveLatency] = useState<number>(0);
+  // ── Manual Address / Coin Loading ───────────────────────────────
+  const [manualAddress, setManualAddress] = useState(
+    "0x8beae79f9b62a33d0646535684e4aa6c5eb755a7772a331e376b884bd428f77b",
+  );
+  const [coins, setCoins] = useState<any[]>([]);
+  const [selectedCoin, setSelectedCoin] = useState<string>("");
+  const [isLoadingCoins, setIsLoadingCoins] = useState(false);
 
-  const fetchBalanceFromDB = async (address: string) => {
-    try {
-      const res = await fetch(`/api/balance?wallet_address=${address}`);
-      const data = await res.json();
-      if (data && typeof data.hex_balance !== 'undefined') {
-        setHexBalance(parseFloat(data.hex_balance));
-        if (typeof data.myrc_balance !== 'undefined') setMyrBalance(parseFloat(data.myrc_balance));
+  // ── Order Form State (values entered in HEX, not MIST) ─────────
+  const [side, setSide] = useState<"Buy" | "Sell">("Sell");
+  const [hexAmount, setHexAmount] = useState<string>("0.05"); // Fix 2: HEX not MIST
+  const [hexPrice, setHexPrice] = useState<string>("1.00"); // Fix 2: HEX price
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [message, setMessage] = useState<{
+    text: string;
+    type: "success" | "error";
+  } | null>(null);
+
+  // ── HEX Stablecoin Balance (on-chain) ──────────────────────────
+  const [hexRawBalance, setHexRawBalance] = useState<number>(0);
+  const [isLoadingHex, setIsLoadingHex] = useState(false);
+  // HEX coin objects (for SELL orders — we need the actual object ID to burn)
+  const [hexCoins, setHexCoins] = useState<any[]>([]);
+  const [selectedHexCoin, setSelectedHexCoin] = useState<string>("");
+
+  // ── Live Orderbook ──────────────────────────────────────────────
+  const [orderbook, setOrderbook] = useState<{ bids: any[]; asks: any[] }>({
+    bids: [],
+    asks: [],
+  });
+
+  // The effective address to use — zkLogin address takes priority over manual
+  const effectiveAddress = suiAddress ?? manualAddress;
+
+  // ── Fetch on-chain HEX balance + coin objects (needed for SELL orders) ────
+  const fetchHexBalance = useCallback(
+    async (addr: string) => {
+      if (!addr || !HEX_COIN_TYPE) return;
+      setIsLoadingHex(true);
+      try {
+        const { data } = await suiClient.getCoins({
+          owner: addr,
+          coinType: HEX_COIN_TYPE,
+        });
+        const total = data.reduce((sum, c) => sum + parseInt(c.balance), 0);
+        setHexRawBalance(total);
+        // Store HEX coin objects so Sell orders can select one to burn
+        setHexCoins(data);
+        if (data.length > 0 && !selectedHexCoin) {
+          setSelectedHexCoin(data[0].coinObjectId);
+        }
+      } catch (e) {
+        console.error("Failed to fetch HEX balance", e);
+      } finally {
+        setIsLoadingHex(false);
       }
-    } catch (e) {
-      console.error("Failed to fetch DB balance", e);
-    }
-  };
+    },
+    [selectedHexCoin],
+  );
 
-  const fetchSuiCoins = async (address: string) => {
-    try {
-      const { data } = await suiClient.getCoins({ owner: address });
-      setTestnetCoins(data);
-    } catch (e) {
-      console.error("Failed to fetch SUI coins", e);
-    }
-  };
-
-  // Load Session
+  // ── Auto-load coins + HEX balance when zkLogin address resolves ─
   useEffect(() => {
-    const savedAddress = localStorage.getItem('hex_user_address');
-    if (savedAddress) {
-      setSuiAddress(savedAddress);
-      fetchBalanceFromDB(savedAddress);
-      fetchSuiCoins(savedAddress);
-    }
-  }, []);
-
-  const logout = () => {
-    localStorage.removeItem('hex_user_address');
-    setSuiAddress(null);
-    setHexBalance(0);
-    setMyrBalance(5000);
-    setTestnetCoins([]);
-  };
-
-  const copyAddress = () => {
     if (suiAddress) {
-      navigator.clipboard.writeText(suiAddress);
-      // Toast could be added here for copied text
+      loadCoins(suiAddress);
+      fetchHexBalance(suiAddress);
+      // Poll HEX balance every 5 seconds
+      const iv = setInterval(() => fetchHexBalance(suiAddress), 5000);
+      return () => clearInterval(iv);
+    }
+  }, [suiAddress, fetchHexBalance]);
+
+  // silent=true → skip clearing the status message (used when called after order submission)
+  const loadCoins = async (addr?: string, silent = false) => {
+    const target = addr ?? effectiveAddress;
+    if (!target) return;
+    setIsLoadingCoins(true);
+    if (!silent) setMessage(null); // only clear message on explicit user-initiated loads
+    try {
+      const { data } = await suiClient.getCoins({ owner: target });
+      setCoins(data);
+      if (data.length > 0) {
+        setSelectedCoin(data[0].coinObjectId);
+      } else if (!silent) {
+        setMessage({
+          text: "No coins found. Get SUI from the Testnet Faucet.",
+          type: "error",
+        });
+      }
+    } catch (e: any) {
+      if (!silent)
+        setMessage({
+          text: "Failed to load coins. Check the address.",
+          type: "error",
+        });
+    } finally {
+      setIsLoadingCoins(false);
     }
   };
 
-  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    let value = e.target.value;
-    
-    // Remove leading zero if the next character is a digit
-    if (value.startsWith('0') && value.length > 1 && value[1] !== '.') {
-        value = value.substring(1);
-    }
-    
-    setSpendInput(value);
+  const fetchOrderbook = async () => {
+    try {
+      const res = await fetch("http://localhost:8080/orderbook");
+      if (res.ok) setOrderbook(await res.json());
+    } catch {}
   };
 
   useEffect(() => {
-    // Generate mock latency every 2 seconds to make the UI feel alive
-    const interval = setInterval(() => {
-      const newLatency = Math.floor(Math.random() * 800) + 10;
-      setLiveLatency(newLatency);
-      setLatencyHistory(prev => [...prev.slice(-9), newLatency]);
-    }, 2000);
-    return () => clearInterval(interval);
+    fetchOrderbook();
+    const iv = setInterval(fetchOrderbook, 2000);
+    return () => clearInterval(iv);
   }, []);
 
-  // Phase 3 Settlement Pool Mock State
-  const [batchProgress, setBatchProgress] = useState(0);
-  const [batchTimeActive, setBatchTimeActive] = useState(0);
-
-  // We can track time spent in 0 state
-  useEffect(() => {
-    const timer = setInterval(() => {
-      setBatchTimeActive(prev => prev + 1);
-    }, 1000);
-    return () => clearInterval(timer);
-  }, []);
-
-  const receiveAmount    = (spendAmount * HEX_RATE).toFixed(2);
-  const isInsufficient   = spendAmount > myrBalance;
-  const priceImpactPct   = (spendAmount / (myrBalance || 1)) * 100;
-  const showPriceImpact  = priceImpactPct > 2;
-
-  const latencyColor = liveLatency < 500 ? "bg-emerald-500" : liveLatency < 1000 ? "bg-amber-400" : "bg-rose-500";
-  const avgLatency = latencyHistory.length ? (latencyHistory.reduce((a, b) => a + b, 0) / latencyHistory.length).toFixed(0) : 0;
-
-  const executeSwap = async () => {
-    setIsSwapping(true);
-    setTradeError(null);
-    setShowConfirmModal(false);
-    const startTime = performance.now();
-    
-    if (testnetCoins.length < 2) {
-      setTradeError("You need at least 2 SUI coins in your wallet to test local settlement swaps. Please get more from the Testnet Faucet or split your coins.");
-      setIsSwapping(false);
+  // ── Submit order — SELL uses HEX coin (to burn), BUY uses SUI coin ─────────
+  const submitOrder = async () => {
+    if (!effectiveAddress || !selectedCoin) {
+      setMessage({
+        text: "Load a SUI coin first (Wallet section).",
+        type: "error",
+      });
       return;
     }
 
-    const order = {
-      order_id: Math.floor(Math.random() * 100000),
-      player_address: suiAddress || "0xAnonymous",
-      asset: "HEX",
-      price: 100,
-      quantity: 1,
-      type: 'Buy'
-    };
-
-    try {
-      // 1. Submit Order to Rust Matching Engine
-      const response = await fetch('http://localhost:8080/place-order', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(order),
-      }).catch(() => {
-        throw new Error("Network Error: Make sure Matching Engine is running on port 8080");
+    // SELL requires a HEX coin to burn on settlement
+    if (side === "Sell" && !selectedHexCoin) {
+      setMessage({
+        text: "No HEX coin found. You need HEX tokens to sell. Buy some first.",
+        type: "error",
       });
-
-      if (!response.ok) {
-        throw new Error(`ORDER_QUEUED timeout (${response.status})`);
-      }
-
-      const { match_result, logs: engineLogs } = await response.json();
-      
-      // 2. Build Transaction Block for Dual-Signing
-      const tx = new Transaction();
-      const PACKAGE_ID = process.env.NEXT_PUBLIC_PACKAGE_ID || "0x0"; 
-      
-      const coinAObjectId = testnetCoins[0].coinObjectId;
-      const coinBObjectId = testnetCoins[1].coinObjectId;
-      const recipientA = suiAddress;
-      const recipientB = "0x0000000000000000000000000000000000000000000000000000000000000000";
-
-      tx.moveCall({
-          target: `${PACKAGE_ID}::settlement::execute_trade`,
-          typeArguments: ["0x2::sui::SUI", "0x2::sui::SUI"],
-          arguments: [
-              tx.object(coinAObjectId),
-              tx.object(coinBObjectId),
-              tx.pure.address(recipientA as string),
-              tx.pure.address(recipientB),
-          ],
-      });
-
-      // 3. Request Gas Station Sponsor
-      const gasStationUrl = process.env.NEXT_PUBLIC_GAS_STATION_URL || 'http://localhost:8081';
-      // Set a generic sender to allow building without a sponsor
-      tx.setSender(suiAddress || "0x0000000000000000000000000000000000000000000000000000000000000000");
-      const txBytes = await tx.build({ client: suiClient });
-      const txBase64 = btoa(txBytes.reduce((data, byte) => data + String.fromCharCode(byte), ''));
-      
-      const sponsorRes = await fetch(`${gasStationUrl}/api/sponsor`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ txBytes: txBase64 }),
-      });
-      
-      if (!sponsorRes.ok) {
-        throw new Error("Failed to get gas sponsorship: " + sponsorRes.statusText);
-      }
-      const { sponsorSignature } = await sponsorRes.json();
-      console.log("Gas Station Response Signature:", sponsorSignature);
-
-      // Note: Actual zkLogin signature submission is omitted for this UI mock since ephemeral keys aren't fully wired for signing here.
-      // await suiClient.executeTransactionBlock({ transactionBlock: txBytes, signature: [userSignature, sponsorSignature] });
-
-      const endTime = performance.now();
-      
-      setLatency(endTime - startTime);
-      setLogs(prev => [...engineLogs.reverse(), ...prev].slice(0, 50));
-      
-      await fetch('/api/balance/update', {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ 
-              address: suiAddress, 
-              add_amount: parseFloat(receiveAmount) 
-          })
-      });
-      if (suiAddress) {
-          fetchBalanceFromDB(suiAddress);
-          fetchSuiCoins(suiAddress); // Refresh coins after mock trade
-      }
-
-      setShowToast(true);
-      setTimeout(() => setShowToast(false), 4000);
-      setSpendInput("0");
-
-    } catch (error: any) {
-      console.error("Trade failed:", error);
-      setTradeError(error.message || "Network Error");
-      setTimeout(() => setTradeError(null), 4000);
-    } finally {
-      setIsSwapping(false);
+      return;
     }
+
+    const parsedAmount = parseFloat(hexAmount);
+    const parsedPrice = parseFloat(hexPrice);
+
+    if (isNaN(parsedAmount) || parsedAmount < MIN_HEX_ORDER) {
+      setMessage({
+        text: `Minimum order is ${MIN_HEX_ORDER} HEX`,
+        type: "error",
+      });
+      return;
+    }
+    if (isNaN(parsedPrice) || parsedPrice <= 0) {
+      setMessage({ text: "Price must be greater than 0", type: "error" });
+      return;
+    }
+
+    // SELL: validate user has enough HEX balance
+    if (side === "Sell") {
+      const amountNeeded = Math.floor(parsedAmount * RAW_PER_HEX);
+      if (amountNeeded > hexRawBalance) {
+        setMessage({
+          text: `Insufficient HEX balance. You have ${(hexRawBalance / RAW_PER_HEX).toFixed(2)} HEX, trying to sell ${parsedAmount.toFixed(2)} HEX.`,
+          type: "error",
+        });
+        return;
+      }
+    }
+
+    const amountRaw = Math.floor(parsedAmount * RAW_PER_HEX);
+    const priceRaw = Math.floor(parsedPrice * RAW_PER_HEX);
+
+    setIsSubmitting(true);
+    setMessage(null);
+    try {
+      const order = {
+        side: side.toLowerCase(),
+        // SELL: use HEX coin type (gas station will burn it)
+        // BUY:  use SUI coin type
+        coin_type: side === "Sell" ? HEX_COIN_TYPE : "0x2::sui::SUI",
+        amount: amountRaw,
+        price: priceRaw,
+        owner_address: effectiveAddress,
+        // SELL: pass HEX coin object so gas station can burn it on match
+        // BUY:  pass SUI coin object (used for gas / settlement reference)
+        coin_object_id: side === "Sell" ? selectedHexCoin : selectedCoin,
+      };
+
+      const res = await fetch("http://localhost:8080/order", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(order),
+      });
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        throw new Error(
+          errBody?.error ?? `Engine rejected order (${res.status})`,
+        );
+      }
+      const data = await res.json();
+
+      // Refresh coins + orderbook silently (don't wipe the success message)
+      fetchOrderbook();
+      await loadCoins(effectiveAddress, true);
+      if (effectiveAddress) fetchHexBalance(effectiveAddress);
+
+      const counterSide = side === "Buy" ? "Sell" : "Buy";
+      setSide(counterSide); // auto-flip for next order
+
+      setMessage({
+        text: `✓ ${side} order accepted! (ID: ${data.order_id?.slice(0, 8)}…) — now submit a matching ${counterSide} order to trigger the match.`,
+        type: "success",
+      });
+    } catch (e: any) {
+      setMessage({
+        text: e.message ?? "Failed to submit order.",
+        type: "error",
+      });
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const logout = () => {
+    setSuiAddress(null);
+    setCoins([]);
+    setSelectedCoin("");
+  };
+
+  const copyAddress = () => {
+    if (suiAddress) navigator.clipboard.writeText(suiAddress);
   };
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 font-sans selection:bg-emerald-500/30">
-      {/* Top Bar Navigation */}
-      <header className="sticky top-0 z-50 flex justify-between items-center px-6 py-4 bg-slate-900/80 backdrop-blur-md border-b border-white/5">
-        <h1 className="text-xl font-bold bg-gradient-to-r from-emerald-400 to-cyan-400 bg-clip-text text-transparent flex items-center gap-2 tracking-tight">
-          <Zap size={20} className="text-emerald-400" /> HEX Hybrid Exchange
+      {/* ── Header ── */}
+      <header className="sticky top-0 z-50 flex justify-between items-center px-6 py-3 bg-slate-900/80 backdrop-blur-md border-b border-white/5">
+        <h1 className="text-lg font-bold bg-gradient-to-r from-emerald-400 to-cyan-400 bg-clip-text text-transparent flex items-center gap-2">
+          <Layers size={18} className="text-emerald-400" /> HEX Hybrid Exchange
         </h1>
-        <div className="flex items-center gap-4">
-          {suiAddress && (
-            <div className="flex items-center gap-2">
-              <button 
+        <div className="flex items-center gap-3">
+          {suiAddress ? (
+            <>
+              <button
                 onClick={copyAddress}
-                className="flex items-center gap-2 bg-slate-800/80 hover:bg-slate-700 px-3 py-1.5 rounded-full border border-white/5 transition-colors group cursor-pointer"
+                className="flex items-center gap-2 bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-full border border-white/5 transition-colors text-sm"
               >
-                <div className="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]"></div>
-                <span className="font-mono text-sm text-slate-300">{suiAddress.slice(0, 6)}...{suiAddress.slice(-4)}</span>
-                <Copy size={12} className="text-slate-500 group-hover:text-emerald-400" />
+                <div className="w-2 h-2 rounded-full bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.8)]" />
+                <span className="font-mono text-slate-300">
+                  {suiAddress.slice(0, 8)}…{suiAddress.slice(-4)}
+                </span>
+                <Copy size={11} className="text-slate-500" />
               </button>
-              <button onClick={logout} className="p-1.5 bg-slate-800/80 hover:bg-rose-500/20 hover:text-rose-400 text-slate-400 rounded-full transition-colors">
+              <button
+                onClick={logout}
+                className="p-1.5 bg-slate-800 hover:bg-rose-500/20 hover:text-rose-400 text-slate-400 rounded-full transition-colors"
+                title="Sign Out"
+              >
                 <LogOut size={14} />
               </button>
-            </div>
+            </>
+          ) : (
+            <span className="text-xs text-slate-500 italic">
+              Not signed in — use Google zkLogin or enter address manually
+            </span>
           )}
           <span className="bg-emerald-500/10 text-emerald-400 px-3 py-1 rounded-full text-xs font-semibold flex items-center gap-1.5 border border-emerald-500/20">
-            <Activity size={12} className="animate-pulse" /> Engine Online
+            <Activity size={11} className="animate-pulse" /> Engine Online
           </span>
         </div>
       </header>
 
-      {/* 60 / 40 Split Layout */}
-      <main className="max-w-7xl mx-auto px-6 py-8 grid grid-cols-1 lg:grid-cols-5 gap-8">
-        
-        {/* Left Column (User Perspective - 60%) */}
-        <section className="lg:col-span-3 space-y-6">
-          
-          {/* Wallet Status Card (Asset Dashboard) */}
-          <div className="p-6 rounded-2xl bg-gradient-to-br from-slate-900 to-slate-800/50 border border-white/10 shadow-xl relative overflow-hidden group hover:border-emerald-500/30 transition-colors">
-            <div className="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity">
-               <ShieldCheck size={120} />
+      <main className="max-w-6xl mx-auto px-6 py-8 grid grid-cols-1 md:grid-cols-12 gap-8">
+        {/* ── Left Column ── */}
+        <div className="md:col-span-5 space-y-5">
+          {/* ── HEX Stablecoin Balance Card ── */}
+          <section className="bg-gradient-to-br from-emerald-950/60 to-slate-900 border border-emerald-500/25 rounded-2xl p-6 shadow-xl relative overflow-hidden">
+            {/* Decorative glow */}
+            <div className="absolute -top-8 -right-8 w-32 h-32 bg-emerald-500/10 rounded-full blur-2xl pointer-events-none" />
+            <div className="flex justify-between items-start mb-4 relative z-10">
+              <div className="flex items-center gap-2">
+                <TrendingUp size={16} className="text-emerald-400" />
+                <h2 className="text-base font-semibold text-slate-200">
+                  My HEX Balance
+                </h2>
+              </div>
+              <button
+                onClick={() => {
+                  const addr = suiAddress ?? manualAddress;
+                  if (addr) fetchHexBalance(addr);
+                }}
+                disabled={isLoadingHex}
+                className="p-1.5 text-slate-500 hover:text-emerald-400 transition-colors"
+                title="Refresh"
+              >
+                <RefreshCw
+                  size={14}
+                  className={isLoadingHex ? "animate-spin" : ""}
+                />
+              </button>
             </div>
-            <h2 className="text-sm text-slate-400 font-medium mb-1 tracking-wider uppercase">Asset Dashboard</h2>
-            <div className="flex justify-between items-end relative z-10">
-               {suiAddress ? (
-                 <div>
-                    <div className="flex items-center gap-3">
-                      <div className="bg-emerald-500/20 p-2 rounded-lg border border-emerald-500/30">
-                        <Wallet size={24} className="text-emerald-400" />
-                      </div>
-                      <p className="text-4xl font-light tracking-tight">{hexBalance.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} <span className="text-xl text-emerald-400 font-medium">HEX</span></p>
-                    </div>
-                 </div>
-               ) : (
-                 <div className="mt-4">
-                    <Auth onLoginSuccess={async (addr, epoch, token) => {
-                      await fetch('/api/user', {
-                         method: 'POST',
-                         headers: { 'Content-Type': 'application/json' },
-                         body: JSON.stringify({ wallet_address: addr })
-                      });
-                      localStorage.setItem('hex_user_address', addr);
-                      setSuiAddress(addr);
-                      setJwtToken(token);
-                      fetchBalanceFromDB(addr);
-                    }} />
-                 </div>
-               )}
-               <div className="flex items-center gap-2 bg-emerald-500/20 text-emerald-300 px-3 py-1 rounded-md text-sm backdrop-blur-sm border border-emerald-500/30">
-                 <CheckCircle2 size={14} /> {suiAddress ? "Session Active" : "Not Authenticated"}
-               </div>
+
+            <div className="relative z-10">
+              {/* HEX Amount */}
+              <div className="mb-1">
+                <span className="text-4xl font-light tracking-tight text-white tabular-nums">
+                  {(hexRawBalance / RAW_PER_HEX).toFixed(2)}
+                </span>
+                <span className="ml-2 text-lg font-semibold text-emerald-400">
+                  HEX
+                </span>
+              </div>
+
+              {/* MYR Value */}
+              <div className="flex items-center gap-2 mb-4">
+                <span className="text-sm text-slate-400">≈</span>
+                <span className="text-xl font-medium text-slate-300 tabular-nums">
+                  MYR{" "}
+                  {(
+                    (hexRawBalance / RAW_PER_HEX) *
+                    HEX_MYR_RATE
+                  ).toLocaleString("en-MY", {
+                    minimumFractionDigits: 2,
+                    maximumFractionDigits: 2,
+                  })}
+                </span>
+              </div>
+
+              {/* Peg Info */}
+              <div className="flex items-center justify-between text-xs text-slate-500 bg-slate-900/50 rounded-lg px-3 py-2 border border-slate-800">
+                <span>Peg Rate</span>
+                <span className="font-mono text-emerald-400/80">
+                  1 HEX = MYR 100.00{" "}
+                  <span className="text-slate-600">(fixed)</span>
+                </span>
+              </div>
+
+              {!suiAddress && hexRawBalance === 0 && (
+                <p className="text-xs text-slate-600 mt-3 italic text-center">
+                  Sign in via zkLogin to see your live on-chain balance
+                </p>
+              )}
             </div>
-          </div>
+          </section>
 
-          {/* Core Swap Interface */}
-          <div className="p-1 rounded-3xl bg-gradient-to-b from-slate-800 to-slate-900 shadow-2xl relative">
-             <div className="bg-slate-950/80 rounded-[1.4rem] p-6 backdrop-blur-xl border border-white/5">
-                <div className="flex justify-between items-center mb-6">
-                   <h2 className="text-lg font-medium text-slate-200">Express Swap</h2>
+          {/* ── zkLogin Card ── */}
+          <section className="bg-gradient-to-br from-slate-900 to-violet-950/20 border border-violet-500/20 rounded-2xl p-6 shadow-xl">
+            <h2 className="text-base font-semibold mb-1 flex items-center gap-2 text-slate-200">
+              <KeyRound size={16} className="text-violet-400" /> Sui zkLogin
+            </h2>
+            <p className="text-xs text-slate-500 mb-4">
+              Sign in with Google to get your Sui address — no seed phrase
+              needed.
+            </p>
+
+            {suiAddress ? (
+              <div className="flex flex-col gap-3">
+                <div className="flex items-start gap-3 bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 px-4 py-3 rounded-xl text-sm">
+                  <CheckCircle2
+                    size={16}
+                    className="text-emerald-400 shrink-0 mt-0.5"
+                  />
+                  <div>
+                    <p className="font-semibold">Session Active</p>
+                    <p className="font-mono text-xs text-slate-400 mt-1 break-all">
+                      {suiAddress}
+                    </p>
+                  </div>
                 </div>
-                
-                {/* Input Fields Mockup */}
-                <div className="space-y-2">
-                   <div className={`bg-slate-900 p-4 rounded-xl border transition-colors ${isInsufficient ? 'border-rose-500/50' : 'border-white/5 group hover:border-slate-700'}`}>
-                      <div className="flex justify-between text-sm text-slate-400 mb-2">
-                         <span>Spend</span>
-                         <div className="flex items-center gap-2">
-                            <span>Balance: {myrBalance.toLocaleString()} MYR</span>
-                            <button onClick={() => setSpendInput(myrBalance.toString())} className="text-[10px] bg-slate-800 hover:bg-slate-700 px-1.5 py-0.5 rounded text-emerald-400 transition-colors border border-slate-700">MAX</button>
-                         </div>
-                      </div>
-                      <div className="flex justify-between items-center">
-                         <input
-                           id="spend-amount"
-                           type="text"
-                           value={spendInput}
-                           onChange={handleInputChange}
-                           className="bg-transparent text-3xl font-light outline-none w-1/2 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
-                         />
-                         <span className="bg-slate-800 px-3 py-1.5 rounded-lg font-medium">MYR</span>
-                      </div>
-                      {isInsufficient && (
-                        <p className="text-xs text-rose-400 mt-2">⚠ Insufficient balance (max {myrBalance} MYR)</p>
-                      )}
-                   </div>
+              </div>
+            ) : (
+              <Auth
+                onLoginSuccess={async (addr, epoch, jwt) => {
+                  setSuiAddress(addr);
+                  // No-op API call — session state lives in React, not MySQL
+                  await fetch("/api/user", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ wallet_address: addr }),
+                  }).catch(() => {});
+                }}
+              />
+            )}
+          </section>
 
-                   <div className="flex justify-center -my-3 relative z-10">
-                      <button className="bg-slate-800 p-2 rounded-xl border border-slate-700 hover:bg-slate-700 hover:border-emerald-500/50 transition-all text-slate-400 hover:text-emerald-400">
-                         <ArrowRightLeft size={18} className="rotate-90" />
-                      </button>
-                   </div>
-
-                   {/* Exchange Rate Info */}
-                   <div className="flex justify-between items-center px-1 pt-2 text-xs text-slate-500">
-                     <span>Exchange Rate: 100 MYR = 1 HEX</span>
-                     {showPriceImpact && (
-                       <span className="text-amber-400 font-semibold">⚠ &gt;2% price impact</span>
-                     )}
-                   </div>
-
-                   <div className="bg-slate-900 p-4 rounded-xl border border-white/5 group hover:border-slate-700 transition-colors">
-                      <div className="flex justify-between text-sm text-slate-400 mb-2">
-                         <span>Receive (Estimated)</span>
-                      </div>
-                      <div className="flex justify-between items-center">
-                         <span className="text-3xl font-light text-emerald-400 w-1/2 tabular-nums">{receiveAmount}</span>
-                         <span className="bg-emerald-500/20 text-emerald-400 px-3 py-1.5 rounded-lg font-medium border border-emerald-500/30 shadow-[0_0_15px_rgba(16,185,129,0.2)]">HEX</span>
-                      </div>
-                   </div>
-                </div>
-
-                {/* Execution Buttons */}
-                <div className="mt-8 grid grid-cols-2 gap-4">
-                  <button 
-                    onClick={() => setShowConfirmModal(true)}
-                    disabled={isInsufficient || spendAmount <= 0 || isSwapping || !suiAddress}
-                    className="col-span-1 flex justify-center items-center gap-2 bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-400 hover:to-emerald-500 text-white font-bold py-4 rounded-xl shadow-[0_0_20px_rgba(16,185,129,0.3)] hover:shadow-[0_0_30px_rgba(16,185,129,0.5)] transition-all active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed disabled:shadow-none"
-                  >
-                    {!suiAddress ? (
-                      'LOGIN REQUIRED'
-                    ) : isSwapping ? (
-                      <><Loader2 size={18} className="animate-spin" /> SWAPPING...</>
-                    ) : (
-                      'SWAP NOW (BUY)'
-                    )}
-                  </button>
-                  <div className="col-span-1 relative group">
-                    <button 
-                      disabled
-                      className="w-full bg-slate-800 text-slate-500 font-bold py-4 rounded-xl transition-all cursor-not-allowed border border-slate-700"
+          {/* ── Wallet / Coin Loader ── */}
+          <section className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl">
+            <h2 className="text-base font-semibold mb-4 flex items-center gap-2 text-slate-200">
+              <Wallet size={16} className="text-cyan-400" /> Wallet
+            </h2>
+            <div className="space-y-4">
+              {/* Manual address input (only if NOT logged in via zkLogin) */}
+              {!suiAddress && (
+                <div>
+                  <label className="text-xs text-slate-500 mb-1 block uppercase tracking-wider">
+                    Manual Address{" "}
+                    <span className="text-slate-600 normal-case">
+                      (for protocol testing)
+                    </span>
+                  </label>
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      value={manualAddress}
+                      onChange={(e) => setManualAddress(e.target.value)}
+                      className="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:border-cyan-500 transition-colors"
+                    />
+                    <button
+                      onClick={() => loadCoins()}
+                      disabled={isLoadingCoins}
+                      className="bg-cyan-600 hover:bg-cyan-500 text-white px-3 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 shrink-0"
                     >
-                      SELL HEX
+                      {isLoadingCoins ? "…" : "Load"}
                     </button>
-                    <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-max bg-slate-800 text-slate-200 text-xs rounded-lg p-2 opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all z-50 shadow-xl border border-slate-700">
-                      Sell flow coming soon
-                      <div className="absolute top-full left-1/2 -translate-x-1/2 border-4 border-transparent border-t-slate-800"></div>
-                    </div>
                   </div>
                 </div>
-             </div>
+              )}
 
-             {/* Success Notification Toast */}
-             <div className={`absolute -top-12 left-1/2 -translate-x-1/2 bg-emerald-500 text-slate-950 px-6 py-2 rounded-full font-medium shadow-lg flex items-center gap-2 transition-all duration-300 ${showToast ? 'opacity-100 translate-y-16' : 'opacity-0 translate-y-0 pointer-events-none'}`}>
-                <CheckCircle2 size={18} /> HEX Coins successfully added to wallet
-             </div>
+              {/* Refresh button when using zkLogin */}
+              {suiAddress && (
+                <button
+                  onClick={() => loadCoins(suiAddress)}
+                  disabled={isLoadingCoins}
+                  className="w-full bg-cyan-600/20 hover:bg-cyan-600/30 border border-cyan-600/30 text-cyan-400 px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
+                >
+                  {isLoadingCoins ? "Refreshing…" : "↻ Refresh My Coins"}
+                </button>
+              )}
 
-             {/* Error Notification Toast */}
-             <div className={`absolute -top-12 left-1/2 -translate-x-1/2 bg-rose-500 text-white px-6 py-2 rounded-full font-medium shadow-lg flex items-center gap-2 transition-all duration-300 ${tradeError ? 'opacity-100 translate-y-16' : 'opacity-0 translate-y-0 pointer-events-none'}`}>
-                <AlertTriangle size={18} /> Swap failed — {tradeError}
-             </div>
-          </div>
-        </section>
-
-        {/* Right Column (Admin Perspective - 40%) */}
-        <section className="lg:col-span-2 flex flex-col gap-6">
-          
-          {/* Compact Latency Status Bar */}
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 flex items-center justify-between shadow-lg">
-            <div className="flex items-center gap-3">
-              <div className={`w-3 h-3 rounded-full ${latencyColor} animate-pulse`}></div>
-              <span className="text-slate-300 font-medium">Engine</span>
-              <span className="text-slate-500 font-mono text-sm">{liveLatency}ms</span>
+              {/* Coin Selector */}
+              {coins.length > 0 && (
+                <div>
+                  <label className="text-xs text-slate-500 mb-1 block uppercase tracking-wider">
+                    Select Coin ({coins.length} found)
+                  </label>
+                  <select
+                    value={selectedCoin}
+                    onChange={(e) => setSelectedCoin(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-cyan-500"
+                  >
+                    {coins.map((c) => (
+                      <option key={c.coinObjectId} value={c.coinObjectId}>
+                        {c.coinObjectId.slice(0, 12)}… —{" "}
+                        {(parseInt(c.balance) / 1_000_000_000).toFixed(4)} SUI
+                      </option>
+                    ))}
+                  </select>
+                  <p className="text-xs text-emerald-400 mt-2 flex items-center gap-1">
+                    <CheckCircle2 size={12} /> Coins loaded from Sui Testnet
+                  </p>
+                </div>
+              )}
             </div>
-            <button 
-              onClick={() => setShowModal(true)}
-              className="text-xs text-emerald-400 hover:text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/20 px-3 py-1.5 rounded-lg transition-colors border border-emerald-500/20"
-            >
-              Details →
-            </button>
-          </div>
+          </section>
 
-          {/* Settlement Mock Queue - Part 3 Redesign */}
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5">
-             <div className="flex justify-between items-center mb-3">
-                <div className="flex items-center gap-2">
-                  <h3 className="text-sm font-medium text-slate-300">Phase 3: Pending Settlement Pool</h3>
-                  {/* Tooltip implementation */}
-                  <div className="relative group cursor-help">
-                    <Info size={14} className="text-slate-500 hover:text-emerald-400 transition-colors" />
-                    <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-64 bg-slate-800 text-slate-200 text-xs rounded-lg p-3 opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all z-50 shadow-xl border border-slate-700">
-                      Your transaction is grouped with others to reduce gas costs. This typically takes 30–90 seconds.
-                      <div className="absolute top-full left-1/2 -translate-x-1/2 border-4 border-transparent border-t-slate-800"></div>
-                    </div>
-                  </div>
-                </div>
-             </div>
-             
-             {/* Text labels rather than 0/3 */}
-             <div className="flex justify-between items-end mb-2">
-                <span className="text-xs text-slate-400">{batchProgress} of 3 transactions batched</span>
-                <span className="text-[10px] text-slate-500 font-mono">Estimated compression: ~45s</span>
-             </div>
-
-             <div className="w-full bg-slate-800 rounded-full h-2 mb-4 overflow-hidden shadow-inner flex">
-               <div 
-                  className="bg-emerald-500 h-2 rounded-full transition-all duration-1000 ease-out" 
-                  style={{ width: `${(batchProgress / 3) * 100}%` }}
-                ></div>
-             </div>
-             
-             {/* Stuck State Warning > 120s */}
-             {batchProgress === 0 && batchTimeActive > 120 ? (
-               <div className="animate-in slide-in-from-top-2 fade-in bg-rose-500/10 border border-rose-500/20 rounded-lg p-3 flex justify-between items-center mt-2">
-                 <span className="text-xs text-rose-400 flex items-center gap-2">
-                   ⚠️ Batch is taking longer than expected.
-                 </span>
-                 <div className="flex gap-2">
-                   <button onClick={() => setBatchTimeActive(0)} className="text-[10px] bg-slate-800 hover:bg-slate-700 px-2 py-1 rounded text-slate-300 transition-colors border border-slate-700">Retry</button>
-                   <button onClick={() => setBatchTimeActive(0)} className="text-[10px] bg-slate-800 hover:bg-slate-700 px-2 py-1 rounded text-rose-400 transition-colors border border-slate-700">Cancel</button>
-                 </div>
-               </div>
-             ) : null}
-          </div>
-        </section>
-
-      </main>
-
-      {/* Swap Confirmation Modal */}
-      {showConfirmModal && (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
-          <div className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-sm shadow-2xl flex flex-col overflow-hidden animate-in fade-in zoom-in duration-200">
-            <div className="p-6">
-              <h3 className="text-lg font-medium text-slate-200 mb-4 flex items-center gap-2">
-                <AlertTriangle size={18} className="text-amber-400" /> Confirm Swap
-              </h3>
-              
-              <div className="space-y-3 bg-slate-800/50 p-4 rounded-xl border border-slate-800 text-sm">
-                <div className="flex justify-between">
-                  <span className="text-slate-400">You Spend</span>
-                  <span className="text-slate-100 font-medium">{spendAmount} MYR</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-400">You Receive</span>
-                  <span className="text-emerald-400 font-medium">{receiveAmount} HEX</span>
-                </div>
-                <div className="border-t border-slate-700 my-2 pt-2 flex justify-between">
-                  <span className="text-slate-400">Rate</span>
-                  <span className="text-slate-300">100 MYR = 1 HEX</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-400">Est. Gas Savings</span>
-                  <span className="text-emerald-400">~$4.20</span>
+          {/* ── Order Form (Fix 2: amounts in HEX) ── */}
+          <section className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl">
+            <h2 className="text-base font-semibold mb-4 flex items-center gap-2 text-slate-200">
+              <ArrowRightLeft size={16} className="text-emerald-400" /> Place
+              Order
+            </h2>
+            <div className="space-y-4">
+              {/* Side Toggle */}
+              <div>
+                <label className="text-xs text-slate-500 mb-1 block uppercase tracking-wider">
+                  Side
+                </label>
+                <div className="flex gap-2 p-1 bg-slate-950 rounded-lg">
+                  {(["Buy", "Sell"] as const).map((s) => (
+                    <button
+                      key={s}
+                      onClick={() => setSide(s)}
+                      className={`flex-1 py-1.5 rounded-md text-sm font-medium transition-all ${
+                        side === s
+                          ? s === "Buy"
+                            ? "bg-emerald-500 text-white shadow"
+                            : "bg-rose-500 text-white shadow"
+                          : "text-slate-400 hover:text-white"
+                      }`}
+                    >
+                      {s}
+                    </button>
+                  ))}
                 </div>
               </div>
-            </div>
 
-            <div className="p-4 border-t border-slate-800 bg-slate-800/30 flex gap-3">
-              <button 
-                onClick={() => setShowConfirmModal(false)}
-                className="flex-1 py-3 text-sm font-medium bg-slate-800 hover:bg-slate-700 rounded-xl transition-colors border border-slate-700"
-              >
-                Cancel
-              </button>
-              <button 
-                onClick={executeSwap}
-                className="flex-1 py-3 text-sm font-bold bg-emerald-500 hover:bg-emerald-400 text-slate-900 rounded-xl transition-colors"
-              >
-                Confirm
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Engine Details Modal */}
-      {showModal && (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
-          <div className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-lg shadow-2xl flex flex-col overflow-hidden animate-in fade-in zoom-in duration-200">
-            
-            {/* Modal Header */}
-            <div className="flex justify-between items-center p-4 border-b border-slate-800 bg-slate-800/50">
-              <h3 className="font-medium text-slate-200">Engine Status</h3>
-              <button onClick={() => setShowModal(false)} className="text-slate-400 hover:text-white transition-colors">
-                <Activity size={18} />
-              </button>
-            </div>
-
-            {/* Modal Body: Stats */}
-            <div className="p-6 space-y-4">
-              <div className="grid grid-cols-2 gap-4 text-sm">
-                <div className="text-slate-500">Current Latency:</div>
-                <div className="text-slate-200 font-mono text-right">{liveLatency} ms</div>
-                
-                <div className="text-slate-500">Rolling Avg (10s):</div>
-                <div className="text-slate-200 font-mono text-right">{avgLatency} ms</div>
-                
-                <div className="text-slate-500">Engine Version:</div>
-                <div className="text-slate-200 text-right">MatchingEngine_V1</div>
-                
-                <div className="text-slate-500">Order Status:</div>
-                <div className="text-emerald-400 text-right">ONLINE</div>
-              </div>
-
-              {/* Modal Body: Live Log Terminal */}
-              <div className="mt-6">
-                <h4 className="text-xs text-slate-500 mb-2 uppercase tracking-wider">Live Log</h4>
-                <div className="bg-black rounded-xl p-3 border border-slate-800 h-48 overflow-y-auto font-mono text-[10px] text-slate-400 space-y-2">
-                  {logs.length === 0 ? (
-                     <div className="opacity-50 text-center mt-6">Awaiting Order Flow...</div>
+              {/* HEX Coin selector — only visible on SELL (user picks which coin to burn) */}
+              {side === "Sell" && (
+                <div className="bg-rose-500/5 border border-rose-500/20 rounded-xl p-3">
+                  <label className="text-xs text-rose-400/80 mb-1 block uppercase tracking-wider font-semibold">
+                    HEX Coin to Sell (will be burned on settlement)
+                  </label>
+                  {hexCoins.length > 0 ? (
+                    <>
+                      <select
+                        value={selectedHexCoin}
+                        onChange={(e) => setSelectedHexCoin(e.target.value)}
+                        className="w-full bg-slate-950 border border-rose-500/30 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-rose-400 text-slate-200"
+                      >
+                        {hexCoins.map((c) => (
+                          <option key={c.coinObjectId} value={c.coinObjectId}>
+                            {c.coinObjectId.slice(0, 12)}… —{" "}
+                            {(parseInt(c.balance) / RAW_PER_HEX).toFixed(2)} HEX
+                          </option>
+                        ))}
+                      </select>
+                      <p className="text-[10px] text-rose-400/60 mt-1">
+                        Available: {(hexRawBalance / RAW_PER_HEX).toFixed(2)}{" "}
+                        HEX total
+                      </p>
+                    </>
                   ) : (
-                     logs.map((log, i) => (
-                       <div key={i} className="border-l-2 border-slate-800 pl-3 py-1 hover:border-emerald-500 transition-colors">
-                         <span className="opacity-50">[{log.timestamp || new Date().toISOString()}]</span>{" "}
-                         <span className="text-cyan-400">{log.module || "Engine"}</span> ::{" "}
-                         <span className={log.event === 'ORDER_MATCHED' ? 'text-emerald-400' : 'text-amber-400'}>{log.event || "LOG"}</span>{" "}
-                         <span className="opacity-50 text-emerald-400/50">{log.performance || ""}</span>
-                       </div>
-                     ))
+                    <p className="text-xs text-rose-400/60 italic py-1">
+                      No HEX coins found. Place a Buy order first to receive
+                      HEX.
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {/* Fix 2: Amount + Price labelled in HEX with raw unit hint */}
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="text-xs text-slate-500 mb-1 block uppercase tracking-wider">
+                    Amount{" "}
+                    <span className="text-emerald-400/60 normal-case">
+                      (HEX)
+                    </span>
+                  </label>
+                  <input
+                    id="order-amount-hex"
+                    type="number"
+                    step="0.01"
+                    min={MIN_HEX_ORDER}
+                    value={hexAmount}
+                    onChange={(e) => setHexAmount(e.target.value)}
+                    placeholder="0.05"
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-emerald-500 transition-colors"
+                  />
+                  <p className="text-[10px] text-slate-600 mt-1">
+                    ={" "}
+                    {(
+                      parseFloat(hexAmount || "0") * RAW_PER_HEX
+                    ).toLocaleString()}{" "}
+                    raw units
+                  </p>
+                </div>
+                <div>
+                  <label className="text-xs text-slate-500 mb-1 block uppercase tracking-wider">
+                    Price{" "}
+                    <span className="text-emerald-400/60 normal-case">
+                      (HEX)
+                    </span>
+                  </label>
+                  <input
+                    id="order-price-hex"
+                    type="number"
+                    step="0.01"
+                    min="0.01"
+                    value={hexPrice}
+                    onChange={(e) => setHexPrice(e.target.value)}
+                    placeholder="1.00"
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-emerald-500 transition-colors"
+                  />
+                  <p className="text-[10px] text-slate-600 mt-1">
+                    ={" "}
+                    {(
+                      parseFloat(hexPrice || "0") * RAW_PER_HEX
+                    ).toLocaleString()}{" "}
+                    raw units
+                  </p>
+                </div>
+              </div>
+
+              <button
+                id="submit-order-btn"
+                onClick={submitOrder}
+                disabled={
+                  isSubmitting ||
+                  !selectedCoin ||
+                  (side === "Sell" && !selectedHexCoin)
+                }
+                className={`w-full py-3 rounded-xl font-bold transition-all shadow-lg text-white disabled:opacity-40 disabled:cursor-not-allowed ${
+                  side === "Buy"
+                    ? "bg-gradient-to-r from-emerald-600 to-emerald-500 hover:from-emerald-500 hover:to-emerald-400 shadow-emerald-900/40"
+                    : "bg-gradient-to-r from-rose-600 to-rose-500 hover:from-rose-500 hover:to-rose-400 shadow-rose-900/40"
+                }`}
+              >
+                {isSubmitting ? "Submitting…" : `Submit ${side} Order`}
+              </button>
+
+              {message && (
+                <div
+                  className={`p-3 rounded-lg text-sm flex items-center gap-2 ${
+                    message.type === "error"
+                      ? "bg-rose-500/10 text-rose-400 border border-rose-500/20"
+                      : "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
+                  }`}
+                >
+                  {message.type === "success" ? (
+                    <CheckCircle2 size={16} />
+                  ) : (
+                    <AlertTriangle size={16} />
+                  )}
+                  {message.text}
+                </div>
+              )}
+            </div>
+          </section>
+        </div>
+
+        {/* ── Right Column: Live Orderbook (Fix 3: display in HEX) ── */}
+        <div className="md:col-span-7">
+          <section
+            className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl flex flex-col"
+            style={{ minHeight: "680px" }}
+          >
+            <h2 className="text-base font-semibold mb-4 flex items-center gap-2 text-slate-200">
+              <BookOpen size={16} className="text-indigo-400" /> Live Orderbook
+              <span className="ml-auto text-xs text-slate-600 font-normal">
+                Auto-refresh 2s
+              </span>
+            </h2>
+
+            <div className="flex-1 bg-slate-950 rounded-xl border border-slate-800 overflow-hidden text-sm flex flex-col">
+              {/* Fix 3: Column headers now say HEX */}
+              <div className="grid grid-cols-3 px-4 py-2.5 bg-slate-900 border-b border-slate-800 text-xs uppercase tracking-wider text-slate-500 font-semibold">
+                <div>Price (HEX)</div>
+                <div className="text-center">Total Qty (HEX)</div>
+                <div className="text-right">Orders</div>
+              </div>
+
+              <div className="flex-1 overflow-y-auto p-3 flex flex-col gap-3">
+                {/* Asks */}
+                <div>
+                  <p className="text-[10px] uppercase tracking-widest text-rose-400/50 px-2 mb-1.5 font-semibold">
+                    Asks — Sell
+                  </p>
+                  {orderbook.asks?.length > 0 ? (
+                    orderbook.asks.map((ask) => {
+                      const totalRaw = ask.orders.reduce(
+                        (a: number, o: any) => a + o.amount,
+                        0,
+                      );
+                      const totalHex = parseFloat(toHexDisplay(totalRaw));
+                      const priceHex = toHexDisplay(ask.price);
+                      return (
+                        <div
+                          key={ask.price}
+                          className="grid grid-cols-3 px-3 py-2 rounded-lg text-rose-400 relative overflow-hidden hover:bg-slate-800/60 transition-colors mb-1"
+                        >
+                          <div
+                            className="absolute inset-0 bg-rose-500/5"
+                            style={{
+                              width: `${Math.min(100, totalHex * 10)}%`,
+                            }}
+                          />
+                          <div className="z-10 font-mono font-semibold">
+                            {priceHex}
+                          </div>
+                          <div className="z-10 font-mono text-center text-slate-300">
+                            {toHexDisplay(totalRaw)}
+                          </div>
+                          <div className="z-10 font-mono text-right text-slate-500">
+                            {ask.orders.length}
+                          </div>
+                        </div>
+                      );
+                    })
+                  ) : (
+                    <div className="text-center py-6 text-slate-700 text-xs italic">
+                      No asks in the book
+                    </div>
+                  )}
+                </div>
+
+                <div className="border-t border-slate-800" />
+
+                {/* Bids */}
+                <div>
+                  <p className="text-[10px] uppercase tracking-widest text-emerald-400/50 px-2 mb-1.5 font-semibold">
+                    Bids — Buy
+                  </p>
+                  {orderbook.bids?.length > 0 ? (
+                    orderbook.bids.map((bid) => {
+                      const totalRaw = bid.orders.reduce(
+                        (a: number, o: any) => a + o.amount,
+                        0,
+                      );
+                      const totalHex = parseFloat(toHexDisplay(totalRaw));
+                      const priceHex = toHexDisplay(bid.price);
+                      return (
+                        <div
+                          key={bid.price}
+                          className="grid grid-cols-3 px-3 py-2 rounded-lg text-emerald-400 relative overflow-hidden hover:bg-slate-800/60 transition-colors mb-1"
+                        >
+                          <div
+                            className="absolute inset-0 bg-emerald-500/5"
+                            style={{
+                              width: `${Math.min(100, totalHex * 10)}%`,
+                            }}
+                          />
+                          <div className="z-10 font-mono font-semibold">
+                            {priceHex}
+                          </div>
+                          <div className="z-10 font-mono text-center text-slate-300">
+                            {toHexDisplay(totalRaw)}
+                          </div>
+                          <div className="z-10 font-mono text-right text-slate-500">
+                            {bid.orders.length}
+                          </div>
+                        </div>
+                      );
+                    })
+                  ) : (
+                    <div className="text-center py-6 text-slate-700 text-xs italic">
+                      No bids in the book
+                    </div>
                   )}
                 </div>
               </div>
             </div>
 
-            {/* Modal Footer */}
-            <div className="p-4 border-t border-slate-800 bg-slate-800/30 flex justify-end gap-3">
-              <button 
-                onClick={() => navigator.clipboard.writeText(JSON.stringify(logs, null, 2))}
-                className="px-4 py-2 text-sm text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 rounded-lg transition-colors border border-slate-700"
-              >
-                Copy Log
-              </button>
-              <button 
-                onClick={() => setShowModal(false)}
-                className="px-4 py-2 text-sm text-slate-900 font-medium bg-emerald-500 hover:bg-emerald-400 rounded-lg transition-colors"
-              >
-                Close
-              </button>
-            </div>
-          </div>
+            <p className="text-xs text-slate-600 mt-3 text-center italic">
+              When a bid &amp; ask cross at the same price, the engine matches
+              them instantly and the Gas Station settles on-chain.
+            </p>
+          </section>
         </div>
-      )}
-
+      </main>
     </div>
   );
 }
