@@ -1,7 +1,9 @@
 "use client";
 import React, { useState, useEffect } from 'react';
 import { Activity, ShieldCheck, Zap, Wallet, ArrowRightLeft, CheckCircle2, Info, Loader2, AlertTriangle, Copy, LogOut } from 'lucide-react';
+import { Transaction } from '@mysten/sui/transactions';
 import { Auth } from '@/components/Auth';
+import { suiClient } from '@/lib/zklogin';
 
 export default function HEXDashboard() {
   const MYR_BALANCE = 5000;          // wallet balance cap
@@ -24,6 +26,7 @@ export default function HEXDashboard() {
   // Phase 4: Auth & zkLogin State
   const [suiAddress, setSuiAddress] = useState<string | null>(null);
   const [jwtToken, setJwtToken] = useState<string | null>(null);
+  const [testnetCoins, setTestnetCoins] = useState<any[]>([]);
 
   const [showModal, setShowModal] = useState(false);
   const [latencyHistory, setLatencyHistory] = useState<number[]>([]);
@@ -42,12 +45,22 @@ export default function HEXDashboard() {
     }
   };
 
+  const fetchSuiCoins = async (address: string) => {
+    try {
+      const { data } = await suiClient.getCoins({ owner: address });
+      setTestnetCoins(data);
+    } catch (e) {
+      console.error("Failed to fetch SUI coins", e);
+    }
+  };
+
   // Load Session
   useEffect(() => {
     const savedAddress = localStorage.getItem('hex_user_address');
     if (savedAddress) {
       setSuiAddress(savedAddress);
       fetchBalanceFromDB(savedAddress);
+      fetchSuiCoins(savedAddress);
     }
   }, []);
 
@@ -56,6 +69,7 @@ export default function HEXDashboard() {
     setSuiAddress(null);
     setHexBalance(0);
     setMyrBalance(5000);
+    setTestnetCoins([]);
   };
 
   const copyAddress = () => {
@@ -112,6 +126,12 @@ export default function HEXDashboard() {
     setShowConfirmModal(false);
     const startTime = performance.now();
     
+    if (testnetCoins.length < 2) {
+      setTradeError("You need at least 2 SUI coins in your wallet to test local settlement swaps. Please get more from the Testnet Faucet or split your coins.");
+      setIsSwapping(false);
+      return;
+    }
+
     const order = {
       order_id: Math.floor(Math.random() * 100000),
       player_address: suiAddress || "0xAnonymous",
@@ -122,15 +142,13 @@ export default function HEXDashboard() {
     };
 
     try {
-      // Short delay to mock network request to local server 
-      await new Promise(resolve => setTimeout(resolve, 600));
-      
+      // 1. Submit Order to Rust Matching Engine
       const response = await fetch('http://localhost:8080/place-order', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(order),
       }).catch(() => {
-        throw new Error("Network Error: Make sure Matching Engine is running");
+        throw new Error("Network Error: Make sure Matching Engine is running on port 8080");
       });
 
       if (!response.ok) {
@@ -138,12 +156,54 @@ export default function HEXDashboard() {
       }
 
       const { match_result, logs: engineLogs } = await response.json();
+      
+      // 2. Build Transaction Block for Dual-Signing
+      const tx = new Transaction();
+      const PACKAGE_ID = process.env.NEXT_PUBLIC_PACKAGE_ID || "0x0"; 
+      
+      const coinAObjectId = testnetCoins[0].coinObjectId;
+      const coinBObjectId = testnetCoins[1].coinObjectId;
+      const recipientA = suiAddress;
+      const recipientB = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+      tx.moveCall({
+          target: `${PACKAGE_ID}::settlement::execute_trade`,
+          typeArguments: ["0x2::sui::SUI", "0x2::sui::SUI"],
+          arguments: [
+              tx.object(coinAObjectId),
+              tx.object(coinBObjectId),
+              tx.pure.address(recipientA as string),
+              tx.pure.address(recipientB),
+          ],
+      });
+
+      // 3. Request Gas Station Sponsor
+      const gasStationUrl = process.env.NEXT_PUBLIC_GAS_STATION_URL || 'http://localhost:8081';
+      // Set a generic sender to allow building without a sponsor
+      tx.setSender(suiAddress || "0x0000000000000000000000000000000000000000000000000000000000000000");
+      const txBytes = await tx.build({ client: suiClient });
+      const txBase64 = btoa(txBytes.reduce((data, byte) => data + String.fromCharCode(byte), ''));
+      
+      const sponsorRes = await fetch(`${gasStationUrl}/api/sponsor`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ txBytes: txBase64 }),
+      });
+      
+      if (!sponsorRes.ok) {
+        throw new Error("Failed to get gas sponsorship: " + sponsorRes.statusText);
+      }
+      const { sponsorSignature } = await sponsorRes.json();
+      console.log("Gas Station Response Signature:", sponsorSignature);
+
+      // Note: Actual zkLogin signature submission is omitted for this UI mock since ephemeral keys aren't fully wired for signing here.
+      // await suiClient.executeTransactionBlock({ transactionBlock: txBytes, signature: [userSignature, sponsorSignature] });
+
       const endTime = performance.now();
       
       setLatency(endTime - startTime);
       setLogs(prev => [...engineLogs.reverse(), ...prev].slice(0, 50));
       
-      // 1. Trigger database update via API
       await fetch('/api/balance/update', {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
@@ -152,15 +212,13 @@ export default function HEXDashboard() {
               add_amount: parseFloat(receiveAmount) 
           })
       });
-      // 2. Refresh UI balance from DB
       if (suiAddress) {
           fetchBalanceFromDB(suiAddress);
+          fetchSuiCoins(suiAddress); // Refresh coins after mock trade
       }
 
       setShowToast(true);
       setTimeout(() => setShowToast(false), 4000);
-      
-      // Clear inputs
       setSpendInput("0");
 
     } catch (error: any) {
